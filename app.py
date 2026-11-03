@@ -6,11 +6,10 @@ import tempfile
 import pandas as pd
 import time
 import threading
+from collections import Counter
 from pathlib import Path
 
 import gradio as gr
-import numpy as np
-import faiss
 from groq import Groq, RateLimitError, APIConnectionError, APIStatusError
 from pypdf import PdfReader
 from pptx import Presentation
@@ -43,24 +42,9 @@ TEACHING_MODES = {
 # In-memory document index. Uploaded files are processed for this running instance.
 document_texts = {}
 all_chunks = []
-# Load the embedding model only when Document Q&A is first used. This lets
-# Render start the Gradio web server before downloading/loading the model.
-embedding_model = None
-_embedding_model_lock = threading.Lock()
-
-def get_embedding_model():
-    global embedding_model
-    if embedding_model is None:
-        with _embedding_model_lock:
-            if embedding_model is None:
-                print("Loading Sentence Transformers library for Document Q&A...", flush=True)
-                from sentence_transformers import SentenceTransformer
-                print("Loading embedding model for Document Q&A...", flush=True)
-                embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-                print("Sentence Transformer model loaded.", flush=True)
-    return embedding_model
-
+# Lightweight keyword retrieval avoids loading PyTorch/Sentence Transformers on Render Free.
 index = None
+
 
 # Render's local filesystem is ephemeral on free instances. SQLite is useful for
 # a demo, but use managed external storage for durable production history.
@@ -163,71 +147,102 @@ def split_text(text, chunk_size=500, overlap=100):
     return chunks
 
 
+def _normalise_uploaded_files(files):
+    """Convert Gradio file values (single, multiple, or file objects) to paths."""
+    if files is None:
+        return []
+    if isinstance(files, (str, os.PathLike)):
+        files = [files]
+    elif not isinstance(files, (list, tuple)):
+        files = [files]
+
+    paths = []
+    for item in files:
+        if item is None:
+            continue
+        candidate = item
+        if isinstance(item, dict):
+            candidate = item.get("path") or item.get("name")
+        else:
+            candidate = getattr(item, "path", None) or getattr(item, "name", None) or item
+        if isinstance(candidate, (str, os.PathLike)):
+            paths.append(os.fspath(candidate))
+    return paths
+
+
 def process_documents(files):
     global document_texts, all_chunks, index
 
-    if not files:
-        return "Please upload at least one document."
+    paths = _normalise_uploaded_files(files)
+    if not paths:
+        return "Please upload at least one PDF, PPTX, or DOCX file, then click Process Documents."
 
+    print(f"[Document Q&A] Processing {len(paths)} uploaded file(s).", flush=True)
     new_texts, new_chunks, errors = {}, [], []
 
-    for file_path in files:
-        name = Path(file_path).name
+    for file_path in paths:
+        file_name = Path(file_path).name or "uploaded document"
         try:
-            text = extract_text(file_path)
-            new_texts[name] = text
-            for chunk in split_text(text):
-                new_chunks.append({"filename": name, "text": chunk})
+            if not Path(file_path).is_file():
+                raise FileNotFoundError("The uploaded temporary file is no longer available. Please upload it again.")
+            extracted = extract_text(file_path)
+            chunks = split_text(extracted)
+            if not chunks:
+                raise ValueError("No readable text could be extracted from this file.")
+            new_texts[file_name] = extracted
+            new_chunks.extend({"filename": file_name, "text": chunk} for chunk in chunks)
+            print(f"[Document Q&A] Processed {file_name}: {len(chunks)} chunk(s).", flush=True)
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
+            message = f"{file_name}: {type(exc).__name__}: {exc}"
+            errors.append(message)
+            print(f"[Document Q&A] ERROR {message}", flush=True)
 
     if not new_chunks:
-        details = "\n".join(errors)
-        return "No documents could be processed.\n" + details
+        details = "\n".join(errors) if errors else "The uploaded files contained no readable text."
+        return "**No documents could be processed.**\n\n" + details
 
-    try:
-        vectors = get_embedding_model().encode(
-            [item["text"] for item in new_chunks],
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        ).astype("float32")
-        new_index = faiss.IndexFlatIP(vectors.shape[1])
-        new_index.add(vectors)
-    except Exception as exc:
-        return f"Could not build the document search index: {exc}"
-
+    # Replace the current in-memory document collection only after at least one
+    # file has been processed successfully.
     document_texts = new_texts
     all_chunks = new_chunks
-    index = new_index
+    index = True
 
     report = (
-        f"Processed {len(new_texts)} document(s) and indexed "
-        f"{len(new_chunks)} text chunks for this running session."
+        f"<span style='color:green'>Successfully processed {len(new_texts)} document(s).</span>\n\n"
+        f"Prepared **{len(new_chunks)} text chunks** for Document Q&A.\n\n"
+        "Search uses lightweight keyword matching, so it does not load PyTorch or Sentence Transformers."
     )
     if errors:
-        report += "\n\nFiles with errors:\n" + "\n".join(errors)
-    report += "\n\nNote: uploaded documents are held in this running app's memory; "
-    report += "they will need to be uploaded again after a service restart."
+        report += "\n\n**Files that could not be processed:**\n\n" + "\n\n".join(errors)
+    report += "\n\n*Note: documents are held in memory and must be uploaded again after a service restart.*"
     return report
 
 
 def search_documents(question, top_k=4):
-    if index is None or index.ntotal == 0:
+    if not all_chunks:
         return []
-    vector = get_embedding_model().encode(
-        [question], convert_to_numpy=True, normalize_embeddings=True
-    ).astype("float32")
-    scores, ids = index.search(vector, min(top_k, index.ntotal))
+
+    # Basic, dependency-free relevance ranking based on query-term overlap.
+    words = re.findall(r"[a-zA-Z0-9]+", question.lower())
+    query_terms = set(words)
+    if not query_terms:
+        return []
+
     results = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx >= 0:
-            item = all_chunks[int(idx)]
+    for item in all_chunks:
+        chunk_terms = re.findall(r"[a-zA-Z0-9]+", item["text"].lower())
+        counts = Counter(chunk_terms)
+        matched = sum(counts.get(term, 0) for term in query_terms)
+        if matched:
+            score = matched / max(len(chunk_terms), 1) ** 0.5
             results.append({
                 "filename": item["filename"],
                 "text": item["text"],
                 "similarity": float(score)
             })
-    return results
+
+    results.sort(key=lambda item: item["similarity"], reverse=True)
+    return results[:top_k]
 
 
 def document_chat(message, history, mode):
@@ -515,7 +530,12 @@ with gr.Blocks(title=APP_NAME, theme=gr.themes.Soft()) as demo:
         )
         process_button = gr.Button("Process Documents", variant="primary")
         upload_status = gr.Markdown()
-        process_button.click(process_documents, inputs=file_input, outputs=upload_status)
+        process_button.click(
+            fn=process_documents,
+            inputs=file_input,
+            outputs=upload_status,
+            show_progress="full"
+        )
         document_mode = gr.Radio(
             ["Beginner", "Detailed", "Interview"],
             value="Beginner", label="Teaching Mode"
@@ -625,4 +645,5 @@ with gr.Blocks(title=APP_NAME, theme=gr.themes.Soft()) as demo:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))
     print("SmartScholar app initialized. Starting Gradio server...", flush=True)
+    print(f"Starting Gradio on port {port}...", flush=True)
     demo.queue().launch(server_name="0.0.0.0", server_port=port)
